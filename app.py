@@ -56,7 +56,7 @@ hydrate_session()
 
 # ── AUTH STEP 3: Gate ─────────────────────────────────────────
 if not is_logged_in():
-    from pages.login import render as login_page
+    from views.login import render as login_page
     login_page()
     st.stop()
 
@@ -65,7 +65,7 @@ if just_logged_in:
     st.toast(f"👋 Welcome, {current_email()}!", icon="✅")
 
 # ── Page imports (only after auth passes) ─────────────────────
-from pages import (
+from views import (
     dashboard, calendar_view, search,
     add_event, add_team, add_squad,
     conflicts, availability, timeline, admin,
