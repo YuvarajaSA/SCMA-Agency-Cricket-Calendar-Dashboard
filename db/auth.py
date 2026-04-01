@@ -1,29 +1,37 @@
 # db/auth.py
 # ══════════════════════════════════════════════════════════════
-#  Authentication & Role Management  — FIXED v2
+#  Authentication — DEFINITIVE FIX
 #
-#  WHY THE OLD VERSION BROKE
-#  ─────────────────────────
-#  1. Supabase default OAuth uses URL HASH fragments (#access_token=…)
-#     Streamlit st.query_params CANNOT read hash fragments — only ?key=val
-#     So the callback silently received nothing and returned False.
+#  ROOT CAUSES OF PREVIOUS FAILURES
+#  ──────────────────────────────────
 #
-#  2. handle_oauth_callback() was called inside login.py, but app.py
-#     checked is_logged_in() BEFORE login.py loaded → callback never ran.
+#  1. PKCE flow requires code_verifier stored in the Supabase
+#     client object (@st.cache_resource). On Streamlit Cloud the
+#     server sleeps between the OAuth redirect and the callback —
+#     the cache is cleared → verifier gone → exchange fails →
+#     login loop. PKCE is unreliable for Streamlit deployments.
 #
-#  3. No session hydration — after every Streamlit rerun st.session_state
-#     is empty and nothing restored the existing Supabase session.
+#  2. get_session() returns Optional[Session] DIRECTLY.
+#     The old code did `resp.session` which is WRONG.
+#     resp IS the session (or None). This broke hydration silently.
 #
-#  THE FIX
-#  ───────
-#  1. Use PKCE flow → Supabase returns ?code=xxx as a query param
-#     Streamlit CAN read query params → exchange code for session
+#  3. handle_oauth_callback() was called inside login.py, AFTER
+#     app.py already ran is_logged_in() → st.stop(). The callback
+#     never ran. Must be first thing in app.py.
 #
-#  2. Call handle_oauth_callback() at the very top of app.py,
-#     BEFORE any is_logged_in() check
+#  4. Second click → 403: Supabase client holds pending PKCE state
+#     from first attempt. New OAuth call conflicts → 403.
+#     Fix: sign_out() before starting any new OAuth flow.
 #
-#  3. Add hydrate_session() — on every load try supabase.auth.get_session()
-#     and restore into session_state if a valid session exists
+#  THE WORKING APPROACH
+#  ─────────────────────
+#  Use IMPLICIT flow (no PKCE).
+#  Supabase returns: yourapp.com/#access_token=...&refresh_token=...
+#  A JS snippet in login.py reads the hash and rewrites the URL
+#  to: yourapp.com/?access_token=...&refresh_token=...
+#  Streamlit CAN read ?query params → set_session() → done.
+#  No code_verifier. No cache dependency. Works after any restart.
+#
 # ══════════════════════════════════════════════════════════════
 
 from __future__ import annotations
@@ -31,25 +39,27 @@ import streamlit as st
 from db.supabase_client import get_client
 
 
-# ── Internal session helpers ──────────────────────────────────
+# ── Internal helpers ──────────────────────────────────────────
 
-def _set_session(session) -> None:
-    """Store Supabase session + user in session_state."""
+def _store_session(session) -> None:
+    """Store a Supabase Session object into session_state."""
+    if session is None:
+        return
     st.session_state["auth_session"] = session
-    st.session_state["auth_user"]    = session.user if session else None
-    # Clear cached role so it gets re-fetched for new user
-    st.session_state.pop("auth_role", None)
+    st.session_state["auth_user"]    = session.user
+    st.session_state.pop("auth_role",  None)   # re-fetch on next get_role()
+    st.session_state.pop("auth_error", None)
 
 
-def _clear_session() -> None:
-    for k in ["auth_session", "auth_user", "auth_role"]:
+def _clear_all() -> None:
+    for k in ["auth_session", "auth_user", "auth_role",
+              "auth_error", "oauth_in_progress"]:
         st.session_state.pop(k, None)
 
 
-# ── Public read API ───────────────────────────────────────────
+# ── Public read helpers ───────────────────────────────────────
 
 def current_user():
-    """Return the logged-in Supabase User object, or None."""
     return st.session_state.get("auth_user")
 
 
@@ -60,133 +70,176 @@ def current_email() -> str:
 
 def is_logged_in() -> bool:
     """
-    True if we have a user in session_state.
-    hydrate_session() must be called before this to restore
-    sessions that survived a Streamlit rerun.
+    Check session_state first (fast path after hydration).
+    hydrate_session() + handle_oauth_callback() must run before this.
     """
     return st.session_state.get("auth_user") is not None
 
 
-# ── SESSION HYDRATION — call on every app load ────────────────
+# ── STEP 1: OAuth callback ────────────────────────────────────
+# Called at the very top of app.py before any auth check.
+# Handles tokens that arrive as query params after OAuth redirect.
+
+def handle_oauth_callback() -> bool:
+    """
+    The JS hash reader in login.py converts:
+        #access_token=XXX&refresh_token=YYY
+    into query params:
+        ?access_token=XXX&refresh_token=YYY
+
+    We read those params and establish the session.
+    Returns True if a new session was created from callback tokens.
+    """
+    params = st.query_params
+
+    # ── Implicit flow: access_token in query params ────────────
+    access_token  = params.get("access_token")
+    refresh_token = params.get("refresh_token", "")
+
+    if access_token:
+        sb = get_client()
+        try:
+            # set_session(access_token: str, refresh_token: str) → AuthResponse
+            resp = sb.auth.set_session(access_token, refresh_token)
+            if resp and resp.session:
+                _store_session(resp.session)
+                # Clean tokens from the URL bar
+                st.query_params.clear()
+                st.session_state.pop("oauth_in_progress", None)
+                return True
+            else:
+                st.session_state["auth_error"] = "Session could not be established."
+                st.query_params.clear()
+                return False
+        except Exception as e:
+            st.session_state["auth_error"] = f"Session error: {e}"
+            st.query_params.clear()
+            return False
+
+    # ── PKCE fallback: ?code= in query params ──────────────────
+    # Handles edge case where Supabase sends a code instead of tokens
+    code = params.get("code")
+    if code:
+        sb = get_client()
+        try:
+            # CodeExchangeParams expects {"auth_code": code}
+            from supabase_auth.types import CodeExchangeParams
+            resp = sb.auth.exchange_code_for_session(
+                CodeExchangeParams(auth_code=code)
+            )
+            if resp and resp.session:
+                _store_session(resp.session)
+                st.query_params.clear()
+                st.session_state.pop("oauth_in_progress", None)
+                return True
+        except Exception:
+            pass
+        st.query_params.clear()
+        return False
+
+    # ── OAuth error params ─────────────────────────────────────
+    error = params.get("error")
+    if error:
+        desc = params.get("error_description", error)
+        st.session_state["auth_error"] = f"OAuth error: {desc}"
+        st.query_params.clear()
+        return False
+
+    return False
+
+
+# ── STEP 2: Session hydration ─────────────────────────────────
+# Called right after handle_oauth_callback() in app.py.
+# Restores session from Supabase client cache on every rerun.
 
 def hydrate_session() -> bool:
     """
-    On every Streamlit rerun, st.session_state starts empty.
-    Supabase-py stores tokens internally in its client object
-    (which IS cached via @st.cache_resource).
-    
-    This function asks the cached Supabase client for its
-    current session and restores it into session_state.
-    
-    Returns True if a valid session was found and restored.
+    st.session_state is wiped on every Streamlit rerun, but the
+    Supabase client (@st.cache_resource) persists across reruns
+    within the same server process.
+
+    IMPORTANT: get_session() returns Optional[Session] DIRECTLY.
+    It does NOT return an object with a .session attribute.
     """
-    # Already hydrated this run
+    # Already hydrated this run — skip the network call
     if st.session_state.get("auth_user"):
         return True
 
     sb = get_client()
     try:
-        resp = sb.auth.get_session()
-        if resp and resp.session and resp.session.user:
-            _set_session(resp.session)
+        # Returns Optional[Session] — not AuthResponse!
+        session = sb.auth.get_session()
+        if session and hasattr(session, "user") and session.user:
+            _store_session(session)
             return True
     except Exception:
         pass
     return False
 
 
-# ── OAUTH CALLBACK — call at very top of app.py ──────────────
-
-def handle_oauth_callback() -> bool:
-    """
-    Supabase PKCE flow redirects back to the app with:
-        ?code=XXXX
-    
-    We exchange that code for a real session.
-    Must be called BEFORE is_logged_in() check in app.py.
-    
-    Returns True if a new session was established from a code.
-    """
-    params = st.query_params
-
-    # ── PKCE: exchange authorization code ────────────────────
-    code = params.get("code")
-    if code:
-        sb = get_client()
-        try:
-            resp = sb.auth.exchange_code_for_session({"auth_code": code})
-            if resp and resp.session:
-                _set_session(resp.session)
-                # Remove ?code= from the URL so it doesn't re-trigger
-                st.query_params.clear()
-                return True
-        except Exception as e:
-            # Clear bad code from URL silently
-            st.query_params.clear()
-        return False
-
-    # ── Implicit fallback: direct tokens in query params ─────
-    # (happens if PKCE isn't available in older supabase-py)
-    access_token  = params.get("access_token")
-    refresh_token = params.get("refresh_token", "")
-    if access_token:
-        sb = get_client()
-        try:
-            resp = sb.auth.set_session(access_token, refresh_token)
-            if resp and resp.session:
-                _set_session(resp.session)
-                st.query_params.clear()
-                return True
-        except Exception:
-            st.query_params.clear()
-        return False
-
-    return False
-
-
-# ── LOGIN ─────────────────────────────────────────────────────
+# ── Login ─────────────────────────────────────────────────────
 
 def login_with_password(email: str, password: str) -> tuple[bool, str]:
     sb = get_client()
     try:
         resp = sb.auth.sign_in_with_password({"email": email, "password": password})
+        # sign_in_with_password returns AuthResponse — has .session
         if resp and resp.session:
-            _set_session(resp.session)
-            return True, "Logged in successfully."
-        return False, "Invalid credentials. Check your email and password."
+            _store_session(resp.session)
+            return True, "Logged in."
+        return False, "Invalid credentials."
     except Exception as e:
         msg = str(e)
-        if "Invalid login" in msg or "invalid_credentials" in msg:
-            return False, "Invalid email or password."
+        if "invalid_credentials" in msg or "Invalid login" in msg:
+            return False, "Incorrect email or password."
         if "Email not confirmed" in msg:
-            return False, "Please confirm your email first — check your inbox."
-        return False, f"Login error: {msg}"
+            return False, "Please confirm your email address first."
+        return False, f"Login failed: {msg}"
 
 
 def login_with_google() -> str:
     """
-    Build and return the Google OAuth URL using PKCE flow.
-    PKCE returns ?code= as a query param — readable by Streamlit.
-    
-    The returned URL should be opened in the browser via st.markdown redirect.
+    Build Google OAuth URL using IMPLICIT flow (no PKCE).
+
+    WHY NO PKCE:
+    PKCE stores a code_verifier in the cached Supabase client.
+    On Streamlit Cloud the server can restart between the OAuth
+    redirect and the callback, clearing @st.cache_resource and
+    losing the verifier → exchange fails → login loop.
+
+    Implicit flow returns tokens in the URL hash.
+    The JS hash reader in login.py converts them to query params
+    so Streamlit can read them.
+
+    WHY sign_out() first:
+    If a previous OAuth attempt left pending PKCE state in the
+    Supabase client, a new sign_in_with_oauth call conflicts with
+    it → 403 on second click. sign_out() clears that state.
     """
-    sb       = get_client()
+    sb = get_client()
+
+    # Clear any stale auth state to prevent 403 on second click
+    try:
+        sb.auth.sign_out()
+    except Exception:
+        pass
+
     redirect = st.secrets["supabase"].get("redirect_url", "")
 
     try:
         resp = sb.auth.sign_in_with_oauth({
             "provider": "google",
             "options": {
-                "redirect_to":        redirect,
-                "flow_type":          "pkce",       # ← KEY FIX: returns ?code= not #hash
+                "redirect_to":  redirect,
                 "query_params": {
                     "access_type": "offline",
-                    "prompt":      "select_account",  # always show account picker
+                    "prompt":      "select_account",
                 },
             },
         })
         return resp.url if resp else ""
     except Exception as e:
+        st.session_state["auth_error"] = f"OAuth init error: {e}"
         return ""
 
 
@@ -196,16 +249,12 @@ def logout() -> None:
         sb.auth.sign_out()
     except Exception:
         pass
-    _clear_session()
+    _clear_all()
 
 
-# ── ROLE MANAGEMENT ───────────────────────────────────────────
+# ── Roles ─────────────────────────────────────────────────────
 
 def get_role() -> str:
-    """
-    Return role for current user. Cached in session_state.
-    Falls back to 'viewer' if no record found.
-    """
     if "auth_role" in st.session_state:
         return st.session_state["auth_role"]
 
@@ -238,7 +287,7 @@ def is_admin() -> bool:
     return get_role() == "admin"
 
 
-# ── USER MANAGEMENT (admin only) ─────────────────────────────
+# ── User management ───────────────────────────────────────────
 
 def list_users() -> list[dict]:
     sb   = get_client()
